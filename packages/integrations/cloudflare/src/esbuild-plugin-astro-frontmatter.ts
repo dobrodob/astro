@@ -3,17 +3,127 @@ import type { DepOptimizationConfig } from 'vite';
 
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---/;
 
-// Matches tokens to skip (strings, template literals, comments) OR a top-level `return`.
-// The first alternative is preserved as-is; only the second is rewritten.
-// Negative lookbehind `(?<!\.)` prevents matching member accesses like `gen.return()`.
-const RETURN_REPLACE_RE =
-	/(\/\/[^\n]*|\/\*[\s\S]*?\*\/|`(?:[^`\\]|\\.)*`|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|(?<!\.)\breturn(\s*;|\b)/g;
+const RETURN_WORD_RE = /\breturn(\s*;|\b)/g;
 
+// Characters that, when they are the last significant token before `/`,
+// indicate the `/` opens a regex literal rather than a division operator.
+// Covers operators, assignment, punctuation, and opening brackets.
+const REGEX_BEFORE = new Set('=+*%!&|^~<>?:,;({[/\n-');
+
+/**
+ * Rewrites `return` → `throw` in frontmatter code while skipping occurrences
+ * inside strings, template literals, comments, and regex literals.
+ *
+ * Uses a character-level scanner instead of a single regex so that every
+ * quoted-context type (including regex literals) is handled correctly.
+ */
 function replaceTopLevelReturns(code: string): string {
-	return code.replace(RETURN_REPLACE_RE, (_match, skip: string | undefined, tail: string) => {
-		if (skip !== undefined) return skip;
-		return tail.trim() === ';' ? 'throw 0;' : 'throw ';
-	});
+	let result = '';
+	let i = 0;
+	// Tracks the last non-whitespace character for regex-vs-division disambiguation.
+	let lastSignificant = '\n';
+
+	while (i < code.length) {
+		const ch = code[i];
+
+		// Line comment
+		if (ch === '/' && code[i + 1] === '/') {
+			const end = code.indexOf('\n', i);
+			if (end === -1) {
+				result += code.slice(i);
+				i = code.length;
+			} else {
+				result += code.slice(i, end);
+				i = end; // '\n' consumed on next iteration
+			}
+			continue;
+		}
+
+		// Block comment
+		if (ch === '/' && code[i + 1] === '*') {
+			const end = code.indexOf('*/', i + 2);
+			if (end === -1) {
+				result += code.slice(i);
+				i = code.length;
+			} else {
+				result += code.slice(i, end + 2);
+				i = end + 2;
+			}
+			continue;
+		}
+
+		// Regex literal: `/` is a regex start when preceded by an operator,
+		// punctuation, or line start — not by an identifier, number, or `)` / `]`.
+		if (ch === '/' && REGEX_BEFORE.has(lastSignificant)) {
+			const start = i;
+			i++; // skip opening `/`
+			while (i < code.length) {
+				if (code[i] === '\\') {
+					i += 2; // skip escaped character
+				} else if (code[i] === '/') {
+					i++; // skip closing `/`
+					// consume optional flags (gimsuy, etc.)
+					while (i < code.length && /[a-z]/i.test(code[i])) i++;
+					break;
+				} else if (code[i] === '\n') {
+					// Unterminated — not actually a regex; treat opening `/` as division.
+					i = start + 1;
+					break;
+				} else {
+					i++;
+				}
+			}
+			result += code.slice(start, i);
+			lastSignificant = '/';
+			continue;
+		}
+
+		// String: single-quoted, double-quoted, or template literal
+		if (ch === '"' || ch === "'" || ch === '`') {
+			const start = i;
+			i++; // skip opening quote
+			while (i < code.length) {
+				if (code[i] === '\\') {
+					i += 2;
+				} else if (code[i] === ch) {
+					i++;
+					break;
+				} else {
+					i++;
+				}
+			}
+			result += code.slice(start, i);
+			lastSignificant = ch;
+			continue;
+		}
+
+		// Possible `return` keyword
+		if (ch === 'r' && code.slice(i, i + 6) === 'return') {
+			// Must be a word boundary before: not preceded by `.` or an identifier char
+			const before = i > 0 ? code[i - 1] : '';
+			const isWordBefore = before !== '' && /[\w.$]/.test(before);
+
+			if (!isWordBefore) {
+				RETURN_WORD_RE.lastIndex = i;
+				const m = RETURN_WORD_RE.exec(code);
+				if (m && m.index === i) {
+					const tail = m[1];
+					result += tail.trim() === ';' ? 'throw 0;' : 'throw ';
+					i = m.index + m[0].length;
+					lastSignificant = ' ';
+					continue;
+				}
+			}
+		}
+
+		result += ch;
+		if (ch !== ' ' && ch !== '\t' && ch !== '\r') {
+			lastSignificant = ch;
+		}
+		i++;
+	}
+
+	return result;
 }
 
 // Not exposed as a type from Vite, so need to grab this way.

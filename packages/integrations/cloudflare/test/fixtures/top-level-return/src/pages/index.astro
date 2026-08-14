@@ -17,6 +17,11 @@ if (guard()) {
 const source = "hello";
 if (!source) return;
 
+// Regex literal containing a quote character — must not desync the tokenizer (#17697)
+function escapeHtml(value: string) {
+  return value.replace(/"/g, "&quot;");
+}
+
 ---
 
 <html>
