@@ -4,7 +4,6 @@ import { checkExistingServer, removeLockFile, writeLockFile } from '../../core/d
 import { resolveRoot } from '../../core/config/config.js';
 import { printHelp } from '../../core/messages/runtime.js';
 import previewServer from '../../core/preview/index.js';
-import { isRunByAgent } from '../agent.js';
 import { type Flags, createLoggerFromFlags, flagsToAstroInlineConfig } from '../flags.js';
 import { background, logs, previewServerCommand, status, stop } from '../server.js';
 
@@ -43,11 +42,6 @@ export async function preview({ flags }: PreviewOptions) {
 		return;
 	}
 
-	const agentDetected = !process.env.ASTRO_PREVIEW_BACKGROUND && isRunByAgent();
-	if (agentDetected) {
-		flags.json = true;
-	}
-
 	const logger = createLoggerFromFlags(flags);
 	const subcommand = flags._[3]?.toString();
 
@@ -66,7 +60,7 @@ export async function preview({ flags }: PreviewOptions) {
 		return;
 	}
 
-	if (flags.background || agentDetected) {
+	if (flags.background) {
 		await background({ flags, logger, config: previewServerCommand });
 		return;
 	}
