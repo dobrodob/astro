@@ -6,6 +6,8 @@ import {
 	ASTRO_LOCALS_HEADER,
 	ASTRO_MIDDLEWARE_SECRET_HEADER,
 	ASTRO_PATH_HEADER,
+	ASTRO_PATH_PARAM,
+	ASTRO_PATH_TOKEN_PARAM,
 	NODE_PATH,
 } from '../index.js';
 
@@ -24,6 +26,13 @@ import {
  * @param logger
  * @returns {Promise<URL>} The path to the bundled file
  */
+export interface EdgeMiddlewareIsrConfig {
+	/** Expanded ISR exclusion patterns (resolved route pathnames, not regexes). */
+	excludePatterns: string[];
+	/** The secret token used to authenticate ISR rewrites. */
+	pathToken: string;
+}
+
 export async function generateEdgeMiddleware(
 	astroMiddlewareEntryPointPath: URL,
 	root: URL,
@@ -31,12 +40,14 @@ export async function generateEdgeMiddleware(
 	outPath: URL,
 	middlewareSecret: string,
 	logger: AstroIntegrationLogger,
+	isrConfig?: EdgeMiddlewareIsrConfig,
 ): Promise<URL> {
 	const code = edgeMiddlewareTemplate(
 		astroMiddlewareEntryPointPath,
 		vercelEdgeMiddlewareHandlerPath,
 		middlewareSecret,
 		logger,
+		isrConfig,
 	);
 	// https://vercel.com/docs/concepts/functions/edge-middleware#create-edge-middleware
 	const bundledFilePath = fileURLToPath(outPath);
@@ -96,6 +107,7 @@ function edgeMiddlewareTemplate(
 	vercelEdgeMiddlewareHandlerPath: URL,
 	middlewareSecret: string,
 	logger: AstroIntegrationLogger,
+	isrConfig?: EdgeMiddlewareIsrConfig,
 ) {
 	const middlewarePath = JSON.stringify(
 		fileURLToPath(astroMiddlewareEntryPointPath).replace(/\\/g, '/'),
@@ -112,10 +124,33 @@ function edgeMiddlewareTemplate(
 		handlerTemplateCall = `await handler({ request, context })`;
 	} else {
 	}
+	// Build the ISR forwarding logic. When ISR is configured, routes not matching
+	// an exclusion pattern forward to the ISR function; excluded routes and
+	// non-ISR setups forward to the Node serverless function.
+	let resolveDestination: string;
+	if (isrConfig) {
+		const excludePatternsJson = JSON.stringify(isrConfig.excludePatterns);
+		resolveDestination = `
+	const _isrExcludePatterns = ${excludePatternsJson};
+	function _resolveDestination(pathname) {
+		const isExcluded = _isrExcludePatterns.some(p => p === pathname);
+		if (isExcluded) {
+			return '/${NODE_PATH}';
+		}
+		return '/_isr?' + '${ASTRO_PATH_PARAM}=' + encodeURIComponent(pathname) + '&${ASTRO_PATH_TOKEN_PARAM}=${isrConfig.pathToken}';
+	}`;
+	} else {
+		resolveDestination = `
+	function _resolveDestination() {
+		return '/${NODE_PATH}';
+	}`;
+	}
+
 	return `
 	${handlerTemplateImport}
 import { onRequest } from ${middlewarePath};
 import { createContext, trySerializeLocals } from 'astro/middleware';
+${resolveDestination}
 export default async function middleware(request, context) {
 	const ctx = createContext({
 		request,
@@ -126,12 +161,14 @@ export default async function middleware(request, context) {
 	const { origin } = new URL(request.url);
 	const next = async () => {
 		const { vercel, ...locals } = ctx.locals;
-		const response = await fetch(new URL('/${NODE_PATH}', request.url), {
+		const pathname = request.url.replace(origin, '');
+		const dest = _resolveDestination(pathname);
+		const response = await fetch(new URL(dest, request.url), {
 			method: request.method,
 			headers: {
 				...Object.fromEntries(request.headers.entries()),
 				'${ASTRO_MIDDLEWARE_SECRET_HEADER}': '${middlewareSecret}',
-				'${ASTRO_PATH_HEADER}': request.url.replace(origin, ''),
+				'${ASTRO_PATH_HEADER}': pathname,
 				'${ASTRO_LOCALS_HEADER}': trySerializeLocals(locals)
 			},
 			...(request.body ? { body: request.body, duplex: 'half' } : {}),

@@ -32,7 +32,7 @@ import {
 	getInjectableWebAnalyticsContent,
 	type VercelWebAnalyticsConfig,
 } from './lib/web-analytics.js';
-import { generateEdgeMiddleware } from './serverless/middleware.js';
+import { type EdgeMiddlewareIsrConfig, generateEdgeMiddleware } from './serverless/middleware.js';
 import { createConfigPlugin } from './vite-plugin-config.js';
 
 const PACKAGE_NAME = '@astrojs/vercel';
@@ -468,20 +468,23 @@ export default function vercelAdapter({
 					);
 
 					const entryFile = new URL(_serverEntry, _buildTempFolder);
+					let expandedExclusions: string[] = [];
 					if (_buildOutput === 'server' && isr) {
 						const isrConfig = typeof isr === 'object' ? isr : {};
 						await builder.buildServerlessFolder(entryFile, NODE_PATH, _config.root);
-						if (isrConfig.exclude?.length) {
-							const expandedExclusions = isrConfig.exclude.flatMap((exclusion) => {
-								if (exclusion instanceof RegExp) {
-									return routes
-										.filter((route) => exclusion.test(route.pattern))
-										.map((route) => route.pattern);
-								}
+						expandedExclusions = isrConfig.exclude?.length
+							? isrConfig.exclude.flatMap((exclusion) => {
+									if (exclusion instanceof RegExp) {
+										return routes
+											.filter((route) => exclusion.test(route.pattern))
+											.map((route) => route.pattern);
+									}
 
-								return [exclusion];
-							});
+									return [exclusion];
+								})
+							: [];
 
+						if (expandedExclusions.length) {
 							const dest = _middlewareEntryPoint ? MIDDLEWARE_PATH : NODE_PATH;
 							for (const route of expandedExclusions) {
 								// vercel interprets src as a regex pattern, so we need to escape it
@@ -504,10 +507,18 @@ export default function vercelAdapter({
 
 							if (!excludeRouteFromIsr) {
 								const src = route.patternRegex.source;
-								const dest =
-									src.startsWith('^\\/_image') || src.startsWith('^\\/_server-islands')
-										? NODE_PATH
-										: getIsrPath(middlewareSecret);
+								const isInternalRoute =
+									src.startsWith('^\\/_image') || src.startsWith('^\\/_server-islands');
+								let dest: string;
+								if (isInternalRoute) {
+									dest = NODE_PATH;
+								} else if (_middlewareEntryPoint) {
+									// Route through edge middleware; the middleware's next()
+									// forwards to the ISR function based on its route table.
+									dest = MIDDLEWARE_PATH;
+								} else {
+									dest = getIsrPath(middlewareSecret);
+								}
 								if (!route.isPrerendered)
 									routeDefinitions.push({
 										src,
@@ -528,10 +539,21 @@ export default function vercelAdapter({
 					}
 
 					if (_middlewareEntryPoint) {
+						// When ISR is active, pass the ISR routing info so the
+						// edge middleware's next() forwards to the ISR function
+						// for non-excluded routes instead of the Node function.
+						const edgeIsrConfig: EdgeMiddlewareIsrConfig | undefined =
+							_buildOutput === 'server' && isr
+								? {
+										excludePatterns: expandedExclusions,
+										pathToken: middlewareSecret,
+									}
+								: undefined;
 						await builder.buildMiddlewareFolder(
 							_middlewareEntryPoint,
 							MIDDLEWARE_PATH,
 							middlewareSecret,
+							edgeIsrConfig,
 						);
 					}
 				}
@@ -749,7 +771,12 @@ class VercelBuilder {
 		});
 	}
 
-	async buildMiddlewareFolder(entry: URL, functionName: string, middlewareSecret: string) {
+	async buildMiddlewareFolder(
+		entry: URL,
+		functionName: string,
+		middlewareSecret: string,
+		isrConfig?: EdgeMiddlewareIsrConfig,
+	) {
 		const functionFolder = new URL(`./functions/${functionName}.func/`, this.outDir);
 
 		await generateEdgeMiddleware(
@@ -759,6 +786,7 @@ class VercelBuilder {
 			new URL('./middleware.mjs', functionFolder),
 			middlewareSecret,
 			this.logger,
+			isrConfig,
 		);
 
 		await writeJson(new URL(`./.vc-config.json`, functionFolder), {
